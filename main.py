@@ -3,13 +3,13 @@ import time
 import os
 from flask import Flask
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 ODDS_API_KEY = os.getenv('ODDS_API_KEY')
 
-POLL_INTERVAL = 300           # 5 min live score checks
-ODDS_REFRESH_INTERVAL = 1800  # 30 min odds refresh
+POLL_INTERVAL = 300
+ODDS_REFRESH_INTERVAL = 1800
 HEAVY_THRESHOLD = 1.60
 
 favorite_cache = {}  # fave_team: {'odd': float, 'home': str, 'away': str, 'is_home': bool, 'match_id': str, 'commence_time': str}
@@ -20,7 +20,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot alive - upcoming odds endpoint"
+    return "Bot alive - pre-match odds"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -36,13 +36,7 @@ def send_discord(msg):
 def refresh_odds():
     global last_odds_refresh
     try:
-        url = (
-            f"https://api.the-odds-api.com/v4/sports/upcoming/odds/"
-            f"?apiKey={ODDS_API_KEY}"
-            f"&regions=eu"
-            f"&markets=h2h"
-            f"&oddsFormat=decimal"
-        )
+        url = f"https://api.the-odds-api.com/v4/sports/upcoming/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h&oddsFormat=decimal"
 
         r = requests.get(url, timeout=15)
         print(f"Odds API status: {r.status_code}")
@@ -63,6 +57,7 @@ def refresh_odds():
                 continue
             commence_time = datetime.fromisoformat(commence_str.rstrip('Z')).replace(tzinfo=timezone.utc)
             if commence_time <= now_utc:
+                print(f"Skipped live game: {game['home_team']} vs {game['away_team']}")
                 continue  # pre-kickoff only
 
             if not game.get('bookmakers'):
@@ -96,13 +91,13 @@ def refresh_odds():
                 new_faves += 1
 
         print(f"Pre-match odds refreshed: {new_faves} heavy faves cached")
-        send_discord(f"🔄 **Pre-match odds refreshed**\nCached {new_faves} heavy faves (≤{HEAVY_THRESHOLD})")
+        send_discord(f"🔄 **Pre-match odds refreshed**\nCached {new_faves} heavy faves (≤{HEAVY_THRESHOLD}) for upcoming games")
 
         last_odds_refresh = time.time()
 
     except Exception as e:
         print("Refresh error:", str(e))
-        send_discord("⚠️ Refresh failed")
+        send_discord("⚠️ Refresh failed - check logs")
 
 # Startup
 print("Starting - initial odds fetch...")
@@ -136,23 +131,36 @@ while True:
             if game_time:
                 game_time = f" ({game_time})"
 
-            for fave_team, data in list(favorite_cache.items()):
-                if fave_team in home or fave_team in away:
-                    score_str = f"{home} {hg}-{ag} {away}{game_time}"
-                    is_losing = (data['is_home'] and hg < ag and ag >= 1) or \
-                                (not data['is_home'] and ag < hg and hg >= 1)
+            is_tied = hg == ag
 
-                    line = f"**{fave_team}** ({data['odd']}) | {score_str}"
-                    live_faves.append({"line": line, "is_losing": is_losing})
+            fave_data = None
+            fave_team = None
+            for ft, data in favorite_cache.items():
+                if ft in home or ft in away:
+                    fave_data = data
+                    fave_team = ft
+                    break
 
-                    match_id = e["id"]
-                    current = (hg, ag)
-                    if match_id not in last_scores or last_scores[match_id] != current:
-                        fave_g = hg if data['is_home'] else ag
-                        opp_g = ag if data['is_home'] else hg
-                        if fave_g == 0 and opp_g >= 1:
-                            alerts.append(f"🚨 **HEAVY FAVE DOWN!** {score_str}\n**{fave_team}** (pre-match {data['odd']}) trailing")
-                        last_scores[match_id] = current
+            if not fave_data and is_tied:
+                print(f"Live tied game skipped (no pre-match fave cached): {home} {hg}-{ag} {away}")
+                continue
+
+            if fave_data:
+                score_str = f"{home} {hg}-{ag} {away}{game_time}"
+                is_losing = (fave_data['is_home'] and hg < ag and ag >= 1) or \
+                            (not fave_data['is_home'] and ag < hg and hg >= 1)
+
+                line = f"**{fave_team}** ({fave_data['odd']}) | {score_str}"
+                live_faves.append({"line": line, "is_losing": is_losing})
+
+                match_id = e["id"]
+                current = (hg, ag)
+                if match_id not in last_scores or last_scores[match_id] != current:
+                    fave_g = hg if fave_data['is_home'] else ag
+                    opp_g = ag if fave_data['is_home'] else hg
+                    if fave_g == 0 and opp_g >= 1:
+                        alerts.append(f"🚨 **HEAVY FAVE DOWN!** {score_str}\n**{fave_team}** (pre-match {fave_data['odd']}) trailing")
+                    last_scores[match_id] = current
 
         if live_faves:
             summary = f"```diff\n**🔴 Live Heavy Faves (pre-match odds only)**\n"
@@ -162,7 +170,7 @@ while True:
             summary += "```"
             send_discord(summary)
         else:
-            print("No live heavy faves right now")
+            send_discord("ℹ️ **No live heavy faves right now**\n(Checked all live matches - none match cached pre-match faves)")
 
         for a in alerts:
             send_discord(a)
