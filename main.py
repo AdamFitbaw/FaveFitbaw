@@ -3,16 +3,16 @@ import time
 import os
 from flask import Flask
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
 ODDS_API_KEY = os.getenv('ODDS_API_KEY')
 
-POLL_INTERVAL = 240           # 5 min
-ODDS_REFRESH_INTERVAL = 1800  # 30 min
+POLL_INTERVAL = 300           # 5 min live scores
+ODDS_REFRESH_INTERVAL = 1800  # 30 min odds refresh
 HEAVY_THRESHOLD = 1.60
 
-favorite_cache = {}  # fave_team: {'odd': float, 'home': str, 'away': str, 'is_home': bool, 'match_id': str, 'commence_time': str}
+favorite_cache = {}  # fave_team: {'odd': float, 'home': str, 'away': str, 'is_home': bool, 'match_id': str}
 last_scores = {}
 last_odds_refresh = 0
 
@@ -20,7 +20,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot alive - using 'upcoming' for reliable odds"
+    return "Bot alive - upcoming odds endpoint"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -36,19 +36,12 @@ def send_discord(msg):
 def refresh_odds():
     global last_odds_refresh
     try:
-        now_utc = datetime.now(timezone.utc)
-        commence_from = now_utc.isoformat().replace('+00:00', 'Z')
-        commence_to = (now_utc + timedelta(hours=6)).isoformat().replace('+00:00', 'Z')
-
-        # Use 'upcoming' - returns upcoming + live across all sports (no sport list needed)
         url = (
             f"https://api.the-odds-api.com/v4/sports/upcoming/odds/"
             f"?apiKey={ODDS_API_KEY}"
             f"&regions=eu"
             f"&markets=h2h"
             f"&oddsFormat=decimal"
-            f"&commenceTimeFrom={commence_from}"
-            f"&commenceTimeTo={commence_to}"
         )
 
         r = requests.get(url, timeout=15)
@@ -60,6 +53,7 @@ def refresh_odds():
 
         odds_data = r.json()
 
+        now_utc = datetime.now(timezone.utc)
         favorite_cache.clear()
         new_faves = 0
 
@@ -69,7 +63,7 @@ def refresh_odds():
                 continue
             commence_time = datetime.fromisoformat(commence_str.rstrip('Z')).replace(tzinfo=timezone.utc)
             if commence_time <= now_utc:
-                continue  # Strict pre-kickoff only
+                continue  # pre-kickoff only
 
             if not game.get('bookmakers'):
                 continue
@@ -96,33 +90,31 @@ def refresh_odds():
                     'home': home,
                     'away': away,
                     'is_home': is_home,
-                    'match_id': game['id'],
-                    'commence_time': commence_str
+                    'match_id': game['id']
                 }
                 new_faves += 1
 
         print(f"Pre-match odds refreshed: {new_faves} heavy faves cached")
-        send_discord(f"🔄 **Pre-match odds refreshed**\nCached {new_faves} heavy faves (≤{HEAVY_THRESHOLD}) for upcoming games")
+        send_discord(f"🔄 **Pre-match odds refreshed**\nCached {new_faves} heavy faves (≤{HEAVY_THRESHOLD})")
 
         last_odds_refresh = time.time()
 
     except Exception as e:
         print("Refresh error:", str(e))
-        send_discord("⚠️ Refresh failed - check logs")
+        send_discord("⚠️ Refresh failed")
 
 # Startup
 print("Starting - initial odds fetch...")
 threading.Thread(target=run_flask, daemon=True).start()
 refresh_odds()
 
-# Main loop
+# Loop
 while True:
     try:
         now = time.time()
         if now - last_odds_refresh >= ODDS_REFRESH_INTERVAL:
             refresh_odds()
 
-        # Live scores
         r = requests.get("https://site.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard", timeout=15)
         events = r.json().get("events", [])
 
