@@ -1,4 +1,3 @@
-```python
 import requests
 import time
 import os
@@ -196,4 +195,3 @@ while True:
         print("Loop error:", e)
 
     time.sleep(POLL_INTERVAL)
-```
