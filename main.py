@@ -3,23 +3,24 @@ import time
 import os
 from flask import Flask
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 
-API_KEY = os.getenv('API_KEY')
 WEBHOOK_URL = os.getenv('WEBHOOK_URL')
-HEADERS = {'x-apisports-key': API_KEY}
+ODDS_API_KEY = os.getenv('ODDS_API_KEY')
 
-POLL_INTERVAL = 250
-HEAVY_FAVE_THRESHOLD = 2.00   # ← lowered for testing (will catch almost everything)
+POLL_INTERVAL = 240  # 5 minutes
+HEAVY_THRESHOLD = 1.60
+ODDS_FETCH_EVERY = 6  # fetch odds every 6 polls (~30 min) to save quota
 
-favorite_cache = {}
+favorite_cache = {}  # team_name: {'odd': float, 'match_id': str}
 last_scores = {}
+poll_count = 0
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return f"✅ Bot alive | Threshold: {HEAVY_FAVE_THRESHOLD}"
+    return "✅ Bot alive - real odds testing"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -28,81 +29,83 @@ def run_flask():
 def send_discord(msg):
     try:
         requests.post(WEBHOOK_URL, json={"content": msg}, timeout=10)
-        print(f"✅ Sent: {msg[:80]}...")
-    except Exception as e:
-        print("Discord error:", e)
+        print(f"✅ Sent: {msg[:120]}...")
+    except:
+        pass
 
-def get_heavy_favorite(fid, home_team, away_team):
-    try:
-        r = requests.get(f"https://v3.football.api-sports.io/odds?fixture={fid}&bet=1", headers=HEADERS, timeout=15)
-        data = r.json()
-        for entry in data.get("response", []):
-            for bookie in entry.get("bookmakers", [])[:3]:
-                for bet in bookie.get("bets", []):
-                    if bet.get("id") == 1 or "winner" in str(bet.get("name","")).lower():
-                        vals = {}
-                        for v in bet.get("values", []):
-                            try:
-                                odd = float(v.get("odd", 0))
-                                val = v.get("value")
-                                if val in ["Home", "1"]:
-                                    vals["Home"] = odd
-                                elif val in ["Away", "2"]:
-                                    vals["Away"] = odd
-                            except:
-                                pass
-                        if len(vals) >= 2:
-                            min_odd = min(vals.values())
-                            if min_odd <= HEAVY_FAVE_THRESHOLD:
-                                fave_side = min(vals, key=vals.get)
-                                if fave_side == "Home":
-                                    return {"team": home_team, "is_home": True, "odd": min_odd}
-                                else:
-                                    return {"team": away_team, "is_home": False, "odd": min_odd}
-        return None
-    except Exception as e:
-        print("Odds fetch error:", e)
-        return None
-
-print("🚀 DEBUG VERSION STARTED — threshold lowered to 2.00")
+print("🚀 Real-odds testing bot started (The Odds API free + ESPN scores)")
 threading.Thread(target=run_flask, daemon=True).start()
-send_discord("🛠️ **DEBUG MODE ACTIVE**\nThreshold lowered to 2.00 for testing\nYou will now get a status update every ~4 minutes")
+send_discord("✅ **Real-Odds Testing Bot ONLINE**\nThreshold ≤1.60\nPolling: 5 min\nOdds fetched every ~30 min\n(You can delete this message)")
 
 while True:
     try:
-        r = requests.get("https://v3.football.api-sports.io/fixtures/live", headers=HEADERS, timeout=15)
-        matches = r.json().get("response", [])
-        print(f"📊 {datetime.now().strftime('%H:%M')} — {len(matches)} live matches")
+        poll_count += 1
 
-        current_faves = []
+        # === FETCH PRE-MATCH ODDS (real bookie odds) ===
+        if poll_count % ODDS_FETCH_EVERY == 1 or poll_count == 1:
+            try:
+                r = requests.get(f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h&oddsFormat=decimal", timeout=15)
+                odds_data = r.json()
+                new_faves = 0
+                for game in odds_data:
+                    if not game.get('bookmakers'):
+                        continue
+                    home = game['home_team']
+                    away = game['away_team']
+                    # Get lowest odds (heaviest fave)
+                    min_odd = 99
+                    fave_team = None
+                    for b in game['bookmakers'][:5]:  # first 5 bookies
+                        for m in b.get('markets', []):
+                            if m.get('key') == 'h2h':
+                                for o in m['outcomes']:
+                                    if o['price'] < min_odd:
+                                        min_odd = o['price']
+                                        fave_team = o['name']
+                    if min_odd <= HEAVY_THRESHOLD and fave_team:
+                        favorite_cache[fave_team] = {'odd': min_odd, 'match_id': game['id']}
+                        new_faves += 1
+                print(f"⭐ Fetched odds — {new_faves} new heavy faves cached")
+            except Exception as e:
+                print("Odds fetch error:", e)
 
-        for m in matches:
-            fid = m["fixture"]["id"]
-            home = m["teams"]["home"]["name"]
-            away = m["teams"]["away"]["name"]
-            hg = m["goals"]["home"] or 0
-            ag = m["goals"]["away"] or 0
-            status = m["fixture"]["status"].get("short", "")
+        # === LIVE SCORES (ALL soccer worldwide - free) ===
+        r = requests.get("https://site.api.espn.com/apis/site/v2/sports/soccer/all/scoreboard", timeout=15)
+        events = r.json().get("events", [])
 
-            if fid not in favorite_cache and status in ["1H", "HT", "2H", "LIVE", "ET", "P"]:
-                fave = get_heavy_favorite(fid, home, away)
-                if fave:
-                    favorite_cache[fid] = fave
-                    print(f"⭐ CACHED: {fave['team']} @ {fave['odd']}")
+        live_faves = []
+        alerts = []
 
-            if fid in favorite_cache:
-                fave = favorite_cache[fid]
-                current_faves.append(f"• **{fave['team']}** ({fave['odd']}) | {home} {hg}-{ag} {away}")
+        for e in events:
+            if e.get("status", {}).get("type", {}).get("state") != "in":
+                continue  # only live
 
-        # ALWAYS send status (even if zero)
-        status_msg = f"**📊 Live Status** ({datetime.now().strftime('%H:%M')})\n"
-        status_msg += f"Live matches: {len(matches)}\n"
-        status_msg += f"Heavy faves (≤{HEAVY_FAVE_THRESHOLD}): {len(current_faves)}\n\n"
-        if current_faves:
-            status_msg += "\n".join(current_faves[:8])
+            comp = e["competitions"][0]
+            home = comp["competitors"][0]["team"]["displayName"]
+            away = comp["competitors"][1]["team"]["displayName"]
+            hg = int(comp["competitors"][0].get("score", 0) or 0)
+            ag = int(comp["competitors"][1].get("score", 0) or 0)
+
+            for fave_team, data in list(favorite_cache.items()):
+                if fave_team in home or fave_team in away:
+                    score_str = f"{home} {hg}-{ag} {away}"
+                    live_faves.append(f"• **{fave_team}** ({data['odd']}) | {score_str}")
+
+                    # Alert if fave is losing
+                    if (fave_team in home and hg < ag and ag >= 1) or (fave_team in away and ag < hg and hg >= 1):
+                        alerts.append(f"🚨 **HEAVY FAVE DOWN!** {score_str}\n**{fave_team}** ({data['odd']}) trailing")
+
+        # Summary every poll
+        if live_faves:
+            summary = f"**🔴 Live Heavy Faves (real odds ≤{HEAVY_THRESHOLD})**\n" + "\n".join(live_faves[:20])
+            if len(live_faves) > 20:
+                summary += f"\n... +{len(live_faves)-20} more"
+            send_discord(summary)
         else:
-            status_msg += "No heavy favorites live right now"
-        send_discord(status_msg)
+            print("No live heavy faves right now")
+
+        for a in alerts:
+            send_discord(a)
 
     except Exception as e:
         print("Loop error:", e)
